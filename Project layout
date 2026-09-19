@@ -1,0 +1,9 @@
+server.js                  Express app, static frontend, API mount
+src/constants.js           Port, TTLs, rate limits, delays
+src/logger.js              pino with credential redaction
+src/security/              session IDs, validation, rate limiting
+src/storage/               SessionStore + filesystem adapter
+src/whatsapp/              Baileys socket, pairing, QR, messages
+src/routes/api.js          HTTP + SSE endpoints
+public/                    Frontend (vanilla HTML/CSS/JS)
+storage/                   Runtime state (auth creds, sessions)
