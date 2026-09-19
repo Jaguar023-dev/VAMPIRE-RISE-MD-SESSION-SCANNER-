@@ -8,7 +8,6 @@ import { generateSessionId, generateClientToken } from '../security/sessionSecur
 import { normalizePhoneNumber, isValidAppSessionId } from '../security/validation.js';
 import { requestPairingCodeForSession } from '../whatsapp/pairingCode.js';
 import { qrToDataUrl } from '../whatsapp/qrHandler.js';
-import { attachConnectionHandler } from '../whatsapp/connectionHandler.js';
 import { createSession, getLiveSocket, removeLiveSocket } from '../whatsapp/sessionManager.js';
 import { buildFirstMessage, buildSessionIdMessage } from '../whatsapp/messages.js';
 import { pairingLimiter, genericLimiter } from '../security/rateLimit.js';
@@ -33,6 +32,8 @@ export function createApiRouter() {
   });
 
   // ─── POST /api/session/:id/pair-phone ───
+  // The pairing code is requested ONLY after the socket is ready.
+  // Readiness is signalled via the onReady callback inside createSession().
   router.post('/session/:id/pair-phone', pairingLimiter, async (req, res) => {
     const { id } = req.params;
     const { phoneNumber, clientToken } = req.body || {};
@@ -59,48 +60,52 @@ export function createApiRouter() {
 
     try {
       await store.update(id, { status: 'INITIALIZING' });
-      const { sock } = await createSession(id);
 
-      let codeRequested = false;
+      let responded = false;
+      let pendingSock = null;
 
-      const requestCodeOnce = async () => {
-        if (codeRequested) return;
-        codeRequested = true;
-        try {
-          const code = await requestPairingCodeForSession(sock, normalized);
-          await store.update(id, { status: 'PAIRING' });
-          if (!res.headersSent) {
-            res.json({ pairingCode: code, status: 'PAIRING' });
+      const { sock } = await createSession(id, {
+        // Fires exactly once when the socket can accept a pairing code.
+        onReady: async () => {
+          try {
+            const code = await requestPairingCodeForSession(sock, normalized);
+            await store.update(id, { status: 'PAIRING' });
+            if (!responded) {
+              responded = true;
+              res.json({ pairingCode: code, status: 'PAIRING' });
+            }
+          } catch (err) {
+            logger.error({ event: 'pairing_code_failed', message: err.message });
+            await store.update(id, { status: 'CONNECTION_FAILED' });
+            if (!responded) {
+              responded = true;
+              res.status(500).json({ error: 'PAIRING_CODE_FAILED' });
+            }
           }
-        } catch (err) {
-          await store.update(id, { status: 'CONNECTION_FAILED' });
-          if (!res.headersSent) {
-            res.status(500).json({ error: 'PAIRING_CODE_FAILED' });
-          }
-        }
-      };
-
-      // The socket is ready for a code request once it starts "connecting"
-      // or emits a QR (same lifecycle stage).
-      sock.ev.on('connection.update', ({ connection, qr }) => {
-        if (!codeRequested && (connection === 'connecting' || qr)) {
-          requestCodeOnce();
-        }
-      });
-
-      attachConnectionHandler(sock, {
+        },
         onAuthenticated: () => runDeliveryFlow(id, store, sock),
         onLoggedOut: () => store.update(id, { status: 'LOGGED_OUT' }),
         onConnectionFailed: () => store.update(id, { status: 'CONNECTION_FAILED' }),
         onRestartRequired: () => { /* Baileys auto-reconnects */ },
       });
 
+      pendingSock = sock;
+
+      // Safety timeout — if the socket never becomes ready, fail cleanly.
       setTimeout(async () => {
+        if (responded) return;
+        responded = true;
         const s = await store.get(id);
         if (s && s.status === 'INITIALIZING') {
           await store.update(id, { status: 'TIMEOUT' });
+          if (!res.headersSent) {
+            res.status(504).json({ error: 'TIMEOUT' });
+          }
         }
       }, 30_000);
+
+      // Keep a reference to prevent unused-var lint complaints in strict setups.
+      void pendingSock;
     } catch (err) {
       logger.error({ event: 'pair_phone_failed', message: err.message });
       await store.update(id, { status: 'CONNECTION_FAILED' });
@@ -122,9 +127,8 @@ export function createApiRouter() {
 
     try {
       await store.update(id, { status: 'INITIALIZING' });
-      const { sock } = await createSession(id);
 
-      attachConnectionHandler(sock, {
+      const { sock } = await createSession(id, {
         onQR: async (qr) => {
           const dataUrl = await qrToDataUrl(qr);
           await store.update(id, { status: 'WAITING_FOR_PAIRING' });
@@ -203,9 +207,9 @@ export function createApiRouter() {
     if (clientToken && clientToken !== session.clientToken) {
       return res.status(403).json({ error: 'FORBIDDEN' });
     }
-    const sock = getLiveSocket(id);
-    if (sock?.sock) {
-      try { await sock.sock.logout(); } catch { /* ignore */ }
+    const entry = getLiveSocket(id);
+    if (entry?.sock) {
+      try { await entry.sock.logout(); } catch { /* ignore */ }
     }
     removeLiveSocket(id);
     await store.delete(id);
