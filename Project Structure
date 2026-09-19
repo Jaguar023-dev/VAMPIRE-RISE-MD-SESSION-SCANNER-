@@ -1,0 +1,25 @@
+vampire-rise-md/
+├── package.json
+├── server.js
+├── src/
+│   ├── constants.js
+│   ├── logger.js
+│   ├── security/
+│   │   ├── sessionSecurity.js
+│   │   ├── rateLimit.js
+│   │   └── validation.js
+│   ├── storage/
+│   │   ├── SessionStore.js
+│   │   └── FilesystemAdapter.js
+│   ├── whatsapp/
+│   │   ├── sessionManager.js
+│   │   ├── connectionHandler.js
+│   │   ├── pairingCode.js
+│   │   ├── qrHandler.js
+│   │   └── messages.js
+│   └── routes/
+│       └── api.js
+└── public/
+    ├── index.html
+    ├── styles.css
+    └── app.js
