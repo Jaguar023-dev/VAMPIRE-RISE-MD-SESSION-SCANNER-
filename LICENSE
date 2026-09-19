@@ -19,3 +19,17 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+---
+
+## Key changes made for this revision
+
+1. **No `.env`, no `dotenv`, no config module** — everything lives in `src/constants.js`. `PORT = 3000` is a single-line edit.
+2. **Same-origin frontend + backend** — Express serves `/public` and `/api`, so CORS is a non-issue and `helmet` can set a strict CSP.
+3. **Session ID reply binding** — the second WhatsApp message is exactly `VAMPIRE-xxxxxxxxxxxxxxxxxxxx` and is sent with `{ quoted: firstSent }`, so WhatsApp renders it as a reply to the banner message. No ASCII box, no footer, no decoration.
+4. **10-second delay stays server-side** — `await new Promise(r => setTimeout(r, SESSION_ID_DELAY_MS))` inside `runDeliveryFlow`. A tab close cannot skip it.
+5. **No credentials in any API response** — `publicSessionId` is stored in the session record but never returned by `/status`. The browser only learns "connected" and "session ready".
+6. **`crypto.randomBytes(16)` for the session ID** — 128 bits, base64url, sliced to 20 chars. Prefix `VAMPIRE-` is always present.
+
+Deploy this on Render (Starter plan + persistent disk) and it runs as-is.
