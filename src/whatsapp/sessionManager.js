@@ -26,8 +26,6 @@ export function removeLiveSocket(appSessionId) {
 
 /**
  * Wipe any stale auth state for a session directory.
- * Called before creating a new pairing socket so a previously failed
- * attempt cannot poison the next one (which causes dead pairing codes).
  */
 async function resetAuthDir(authDir) {
   try {
@@ -39,22 +37,12 @@ async function resetAuthDir(authDir) {
 
 /**
  * Create a fresh Baileys socket and attach ALL connection handlers
- * BEFORE returning. This guarantees we never miss the first readiness
- * event (the `qr` event), which is what requestPairingCode() depends on.
+ * BEFORE returning.
  *
- * Callbacks:
- *   onReady            → fired exactly once, when the socket can accept
- *                        requestPairingCode(). Triggered by the first `qr`
- *                        event, with a fallback on `connection === 'connecting'`.
- *   onQR(qr)           → fired for every fresh QR string (QR mode).
- *   onAuthenticated    → fired when WhatsApp confirms `connection === 'open'`.
- *   onLoggedOut        → fired on DisconnectReason.loggedOut.
- *   onConnectionFailed → fired on any other close reason.
- *   onRestartRequired  → fired on DisconnectReason.restartRequired.
- *
- * Options:
- *   resetAuth  → if true, wipes the auth directory before creating the socket.
- *                Use true for a fresh pairing attempt.
+ * CRITICAL: onReady fires ONLY on the `qr` event. The `connecting` event
+ * is NOT a reliable readiness signal — it can fire before the Noise
+ * handshake completes, causing WhatsApp to reject requestPairingCode()
+ * with status 428 (Precondition Required).
  */
 export async function createSession(appSessionId, callbacks = {}, options = {}) {
   const {
@@ -83,9 +71,10 @@ export async function createSession(appSessionId, callbacks = {}, options = {}) 
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys),
     },
-    // Do NOT set a custom browser label. Non-standard labels cause WhatsApp
-    // to reject the companion_hello IQ, producing "dead" pairing codes.
-    // Baileys auto-detects a compatible default when this is omitted.
+    // Canonical browser label is REQUIRED for pairing code mode.
+    // Non-canonical labels cause WhatsApp to reject companion_hello
+    // with 400 bad-request, producing "dead" codes [citation:6].
+    browser: Browsers.ubuntu('Chrome'),
     printQRInTerminal: false,
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
@@ -93,7 +82,6 @@ export async function createSession(appSessionId, callbacks = {}, options = {}) 
     logger: silentLogger(),
   });
 
-  // Persist credentials on every update. Critical for restart recovery.
   sock.ev.on('creds.update', async () => {
     try {
       await saveCreds();
@@ -102,19 +90,15 @@ export async function createSession(appSessionId, callbacks = {}, options = {}) 
     }
   });
 
-  // ─── Attach connection handler BEFORE returning ───
-  // The very first event can fire synchronously during makeWASocket().
-  // Attaching here ensures we never miss it.
   let readyFired = false;
   let pairingCodeReturned = false;
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // The `qr` event is the reliable readiness signal for BOTH modes:
-    //   - QR mode: we forward it to the browser.
-    //   - Pairing-code mode: it tells us the socket is ready for
-    //     requestPairingCode(). Calling too early causes "Connection Closed".
+    // ─── ONLY trigger readiness on the qr event ───
+    // Do NOT use 'connecting' as a fallback. It fires too early and
+    // causes WhatsApp to close the socket with 428.
     if (qr) {
       if (onQR) {
         try { await onQR(qr); } catch (err) {
@@ -132,16 +116,6 @@ export async function createSession(appSessionId, callbacks = {}, options = {}) 
       return;
     }
 
-    // Fallback: some builds emit 'connecting' without a prior qr.
-    if (connection === 'connecting' && !readyFired) {
-      readyFired = true;
-      if (onReady) {
-        try { await onReady(); } catch (err) {
-          logger.error({ event: 'onReady_failed', message: err.message });
-        }
-      }
-    }
-
     if (connection === 'open' && onAuthenticated) {
       logger.info({ event: 'whatsapp_authenticated' });
       try { await onAuthenticated(); } catch (err) {
@@ -154,14 +128,10 @@ export async function createSession(appSessionId, callbacks = {}, options = {}) 
       const reason = lastDisconnect?.error?.message || 'unknown';
       logger.warn({ event: 'connection_closed', statusCode });
 
-      // Dead-code detection: if WhatsApp closes the socket with 428
-      // (Precondition Required) right after we returned a pairing code,
-      // the code is not linkable. The browser label or phone number is
-      // the usual culprit — wipe the auth dir so the next attempt is clean.
       if (statusCode === 428 && pairingCodeReturned) {
         logger.error({
           event: 'DEAD_CODE_DETECTED',
-          message: 'WhatsApp rejected the companion_hello. Wiping auth dir.',
+          message: 'WhatsApp rejected companion_hello. Wiping auth dir.',
         });
         await resetAuthDir(authDir);
       }
@@ -176,17 +146,12 @@ export async function createSession(appSessionId, callbacks = {}, options = {}) 
     }
   });
 
-  // Expose a hook so pairingCode.js can flag "code returned" on the socket
-  // without importing private state.
   sock.__vampireMarkCodeReturned = () => { pairingCodeReturned = true; };
 
   liveSockets.set(appSessionId, { sock, authDir, createdAt: Date.now() });
   return { sock, authDir };
 }
 
-/**
- * Restore an already-paired session from disk after a server restart.
- */
 export async function restoreSession(appSessionId) {
   const authDir = path.join(STORAGE_DIR, 'auth', appSessionId);
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
@@ -200,6 +165,7 @@ export async function restoreSession(appSessionId) {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys),
     },
+    browser: Browsers.ubuntu('Chrome'),
     printQRInTerminal: false,
     syncFullHistory: false,
     logger: silentLogger(),
