@@ -14,6 +14,13 @@ export async function requestPairingCodeForSession(sock, normalizedPhone) {
 
   try {
     const code = await sock.requestPairingCode(normalizedPhone);
+
+    // Tell sessionManager.js that a code was returned so it can detect
+    // a 428 close (dead code) and wipe the auth dir.
+    if (typeof sock.__vampireMarkCodeReturned === 'function') {
+      sock.__vampireMarkCodeReturned();
+    }
+
     logger.info({ event: 'pairing_code_generated' });
     return code;
   } catch (err) {
