@@ -1,9 +1,5 @@
 import { logger } from '../logger.js';
 
-/**
- * Request a pairing code. MUST only be called after the socket is ready
- * (connection === 'connecting' or a QR event has fired).
- */
 export async function requestPairingCodeForSession(sock, normalizedPhone) {
   if (!normalizedPhone || !/^[0-9]{10,15}$/.test(normalizedPhone)) {
     throw new Error('INVALID_PHONE');
@@ -15,8 +11,6 @@ export async function requestPairingCodeForSession(sock, normalizedPhone) {
   try {
     const code = await sock.requestPairingCode(normalizedPhone);
 
-    // Tell sessionManager.js that a code was returned so it can detect
-    // a 428 close (dead code) and wipe the auth dir.
     if (typeof sock.__vampireMarkCodeReturned === 'function') {
       sock.__vampireMarkCodeReturned();
     }
