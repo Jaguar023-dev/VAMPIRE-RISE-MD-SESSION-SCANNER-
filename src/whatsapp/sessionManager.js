@@ -6,6 +6,7 @@ import makeWASocket, {
   DisconnectReason,
 } from '@whiskeysockets/baileys';
 import path from 'node:path';
+import fs from 'node:fs/promises';
 import { STORAGE_DIR } from '../constants.js';
 import { logger } from '../logger.js';
 
@@ -24,6 +25,19 @@ export function removeLiveSocket(appSessionId) {
 }
 
 /**
+ * Wipe any stale auth state for a session directory.
+ * Called before creating a new pairing socket so a previously failed
+ * attempt cannot poison the next one (which causes dead pairing codes).
+ */
+async function resetAuthDir(authDir) {
+  try {
+    await fs.rm(authDir, { recursive: true, force: true });
+  } catch (err) {
+    logger.warn({ event: 'auth_dir_reset_failed', message: err.message });
+  }
+}
+
+/**
  * Create a fresh Baileys socket and attach ALL connection handlers
  * BEFORE returning. This guarantees we never miss the first readiness
  * event (the `qr` event), which is what requestPairingCode() depends on.
@@ -37,8 +51,12 @@ export function removeLiveSocket(appSessionId) {
  *   onLoggedOut        → fired on DisconnectReason.loggedOut.
  *   onConnectionFailed → fired on any other close reason.
  *   onRestartRequired  → fired on DisconnectReason.restartRequired.
+ *
+ * Options:
+ *   resetAuth  → if true, wipes the auth directory before creating the socket.
+ *                Use true for a fresh pairing attempt.
  */
-export async function createSession(appSessionId, callbacks = {}) {
+export async function createSession(appSessionId, callbacks = {}, options = {}) {
   const {
     onReady,
     onQR,
@@ -48,7 +66,14 @@ export async function createSession(appSessionId, callbacks = {}) {
     onRestartRequired,
   } = callbacks;
 
+  const { resetAuth = false } = options;
+
   const authDir = path.join(STORAGE_DIR, 'auth', appSessionId);
+
+  if (resetAuth) {
+    await resetAuthDir(authDir);
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -58,8 +83,9 @@ export async function createSession(appSessionId, callbacks = {}) {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys),
     },
-    // Canonical browser label — custom labels produce dead pairing codes.
-    browser: Browsers.ubuntu('Chrome'),
+    // Do NOT set a custom browser label. Non-standard labels cause WhatsApp
+    // to reject the companion_hello IQ, producing "dead" pairing codes.
+    // Baileys auto-detects a compatible default when this is omitted.
     printQRInTerminal: false,
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
@@ -80,6 +106,7 @@ export async function createSession(appSessionId, callbacks = {}) {
   // The very first event can fire synchronously during makeWASocket().
   // Attaching here ensures we never miss it.
   let readyFired = false;
+  let pairingCodeReturned = false;
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -127,6 +154,18 @@ export async function createSession(appSessionId, callbacks = {}) {
       const reason = lastDisconnect?.error?.message || 'unknown';
       logger.warn({ event: 'connection_closed', statusCode });
 
+      // Dead-code detection: if WhatsApp closes the socket with 428
+      // (Precondition Required) right after we returned a pairing code,
+      // the code is not linkable. The browser label or phone number is
+      // the usual culprit — wipe the auth dir so the next attempt is clean.
+      if (statusCode === 428 && pairingCodeReturned) {
+        logger.error({
+          event: 'DEAD_CODE_DETECTED',
+          message: 'WhatsApp rejected the companion_hello. Wiping auth dir.',
+        });
+        await resetAuthDir(authDir);
+      }
+
       if (statusCode === DisconnectReason.loggedOut) {
         onLoggedOut?.();
       } else if (statusCode === DisconnectReason.restartRequired) {
@@ -136,6 +175,10 @@ export async function createSession(appSessionId, callbacks = {}) {
       }
     }
   });
+
+  // Expose a hook so pairingCode.js can flag "code returned" on the socket
+  // without importing private state.
+  sock.__vampireMarkCodeReturned = () => { pairingCodeReturned = true; };
 
   liveSockets.set(appSessionId, { sock, authDir, createdAt: Date.now() });
   return { sock, authDir };
@@ -157,7 +200,6 @@ export async function restoreSession(appSessionId) {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys),
     },
-    browser: Browsers.ubuntu('Chrome'),
     printQRInTerminal: false,
     syncFullHistory: false,
     logger: silentLogger(),
