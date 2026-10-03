@@ -18,7 +18,6 @@ export function createApiRouter() {
 
   router.use(genericLimiter);
 
-  // ─── POST /api/session/create ───
   router.post('/session/create', async (req, res) => {
     try {
       const appSessionId = crypto.randomUUID();
@@ -31,9 +30,6 @@ export function createApiRouter() {
     }
   });
 
-  // ─── POST /api/session/:id/pair-phone ───
-  // The pairing code is requested ONLY after the socket is ready.
-  // Readiness is signalled via the onReady callback inside createSession().
   router.post('/session/:id/pair-phone', pairingLimiter, async (req, res) => {
     const { id } = req.params;
     const { phoneNumber, clientToken } = req.body || {};
@@ -62,11 +58,11 @@ export function createApiRouter() {
       await store.update(id, { status: 'INITIALIZING' });
 
       let responded = false;
-      let pendingSock = null;
 
-            const { sock } = await createSession(id, {
+      const { sock } = await createSession(id, {
         onReady: async () => {
           try {
+            // The qr event has fired — socket is now ready for pairing code.
             const code = await requestPairingCodeForSession(sock, normalized);
             await store.update(id, { status: 'PAIRING' });
             if (!responded) {
@@ -88,9 +84,6 @@ export function createApiRouter() {
         onRestartRequired: () => { /* Baileys auto-reconnects */ },
       }, { resetAuth: true });
 
-      pendingSock = sock;
-
-      // Safety timeout — if the socket never becomes ready, fail cleanly.
       setTimeout(async () => {
         if (responded) return;
         responded = true;
@@ -102,9 +95,6 @@ export function createApiRouter() {
           }
         }
       }, 30_000);
-
-      // Keep a reference to prevent unused-var lint complaints in strict setups.
-      void pendingSock;
     } catch (err) {
       logger.error({ event: 'pair_phone_failed', message: err.message });
       await store.update(id, { status: 'CONNECTION_FAILED' });
@@ -112,7 +102,6 @@ export function createApiRouter() {
     }
   });
 
-  // ─── GET /api/session/:id/qr ───
   router.get('/session/:id/qr', pairingLimiter, async (req, res) => {
     const { id } = req.params;
     if (!isValidAppSessionId(id)) {
@@ -152,7 +141,6 @@ export function createApiRouter() {
     }
   });
 
-  // ─── GET /api/session/:id/status ───
   router.get('/session/:id/status', async (req, res) => {
     const { id } = req.params;
     if (!isValidAppSessionId(id)) {
@@ -166,7 +154,6 @@ export function createApiRouter() {
     });
   });
 
-  // ─── GET /api/session/:id/events (SSE) ───
   router.get('/session/:id/events', (req, res) => {
     const { id } = req.params;
     if (!isValidAppSessionId(id)) {
@@ -194,7 +181,6 @@ export function createApiRouter() {
     });
   });
 
-  // ─── DELETE /api/session/:id ───
   router.delete('/session/:id', async (req, res) => {
     const { id } = req.params;
     const { clientToken } = req.body || {};
@@ -218,7 +204,6 @@ export function createApiRouter() {
   return router;
 }
 
-// ─── In-process event bus ───
 const subscribers = new Map();
 
 function subscribeToSession(appSessionId, fn) {
@@ -236,13 +221,6 @@ function publishToSession(appSessionId, event) {
   }
 }
 
-/**
- * Delivery flow:
- *   1. Generate session ID
- *   2. Send first (banner) message
- *   3. Wait 10s server-side
- *   4. Reply to the first message with ONLY the session ID
- */
 async function runDeliveryFlow(appSessionId, store, sock) {
   try {
     await store.update(appSessionId, { status: 'AUTHENTICATED' });
@@ -253,7 +231,6 @@ async function runDeliveryFlow(appSessionId, store, sock) {
       logger.error({ event: 'no_user_jid_after_auth' });
       return;
     }
-    // Strip device suffix: "254...:12@s.whatsapp.net" → "254...@s.whatsapp.net"
     const userJid = me.id.replace(/:\d+/, '');
 
     await store.update(appSessionId, { status: 'GENERATING_SESSION' });
@@ -261,14 +238,11 @@ async function runDeliveryFlow(appSessionId, store, sock) {
 
     const publicSessionId = generateSessionId();
 
-    // 1. Send the banner message.
     const firstSent = await sock.sendMessage(userJid, { text: buildFirstMessage() });
     logger.info({ event: 'session_message_sent' });
 
-    // 2. Server-side 10-second delay. Never trust a browser timer here.
     await new Promise((resolve) => setTimeout(resolve, SESSION_ID_DELAY_MS));
 
-    // 3. Send the session ID alone, as a quoted reply.
     await sock.sendMessage(
       userJid,
       { text: buildSessionIdMessage(publicSessionId) },
