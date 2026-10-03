@@ -64,8 +64,7 @@ export function createApiRouter() {
       let responded = false;
       let pendingSock = null;
 
-      const { sock } = await createSession(id, {
-        // Fires exactly once when the socket can accept a pairing code.
+            const { sock } = await createSession(id, {
         onReady: async () => {
           try {
             const code = await requestPairingCodeForSession(sock, normalized);
@@ -87,7 +86,7 @@ export function createApiRouter() {
         onLoggedOut: () => store.update(id, { status: 'LOGGED_OUT' }),
         onConnectionFailed: () => store.update(id, { status: 'CONNECTION_FAILED' }),
         onRestartRequired: () => { /* Baileys auto-reconnects */ },
-      });
+      }, { resetAuth: true });
 
       pendingSock = sock;
 
